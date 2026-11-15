@@ -11,7 +11,7 @@ case "${LC_ALL:-${LANG:-C}}" in
     *) export LC_ALL=C.UTF-8 ;;
 esac
 
-PARSER_VERSION="0.5.5"
+PARSER_VERSION="0.5.6"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 AWK_PROG="$SCRIPT_DIR/kuma-log-errors.awk"
 EXTRACT_PROG="$SCRIPT_DIR/kuma-log-extract.py"
@@ -1221,13 +1221,15 @@ print_host() {
 }
 
 emit_disk_rows() {
-    local i mnt used avail size tag plain colored
+    local i mnt fs used avail size tag plain colored
     if [[ ${#disk_mnt[@]} -eq 0 ]]; then
         emit "  дисковые точки не распознаны"
         return 0
     fi
     for i in "${!disk_mnt[@]}"; do
         mnt=${disk_mnt[$i]}
+        fs=${disk_fs[$i]:-—}
+        [[ -n "$fs" && "$fs" != "?" ]] || fs="—"
         used=${disk_used[$i]:-—}
         avail=${disk_avail[$i]:-—}
         size=${disk_size[$i]:-—}
@@ -1238,11 +1240,12 @@ emit_disk_rows() {
         if [[ "$mnt" == "/kuma" || "$mnt" == /opt/kaspersky || "$mnt" == /opt/kaspersky/* ]]; then
             tag="   данные KUMA"
         fi
-        plain=$(printf '  %-16s свободно %-8s занято %-8s всего %-8s%s' "$mnt" "$avail" "$used" "$size" "$tag")
+        plain=$(printf '  %-16s %-8s свободно %-8s занято %-8s всего %-8s%s' "$mnt" "$fs" "$avail" "$used" "$size" "$tag")
         colored=$plain
         if (( USE_COLOR )); then
-            colored=$(printf '  %s%-16s%s свободно %-8s занято %-8s всего %-8s%s%s%s' \
-                "$C_DISK" "$mnt" "$RST" "$avail" "$used" "$size" "$BOLD$C_DISK" "$tag" "$RST")
+            colored=$(printf '  %s%-16s%s %s%-8s%s свободно %-8s занято %-8s всего %-8s%s%s%s' \
+                "$C_DISK" "$mnt" "$RST" "$C_HOST" "$fs" "$RST" \
+                "$avail" "$used" "$size" "$BOLD$C_DISK" "$tag" "$RST")
         fi
         view_put "$plain" "$colored"
     done
@@ -1269,7 +1272,7 @@ print_disks() {
         emit "  Файл не найден."
         return
     fi
-    emit "  По каждой дисковой точке: свободно, занято, всего. proc, sysfs, tmpfs и snap не показаны."
+    emit "  По каждой дисковой точке: тип ФС, свободно, занято, всего. proc, sysfs, tmpfs и snap не показаны."
     emit ""
     emit_disk_rows
 }
@@ -1850,10 +1853,10 @@ home_kv() {
 }
 
 home_meter() {
-    local label="$1" pair="$2" pct="$3" extra="${4:-}"
-    local lab room pair_show bar="" bar_f="" bar_e="" filled=0 i
+    local label="$1" pair="$2" pct="$3" extra="${4:-}" fs="${5:-}"
+    local lab fs_show="" room pair_show bar="" bar_f="" bar_e="" filled=0 i
     local pcolor="$C_TEXT" bar_col="$C_OK" need use_bar=0 use_extra=0
-    local plain colored
+    local plain colored prefix
     if [[ "$pct" =~ ^[0-9]+$ ]]; then
         if (( pct >= 90 )); then
             pcolor="$C_BAD"
@@ -1874,7 +1877,12 @@ home_meter() {
         bar="[${bar_f}${bar_e}]"
     fi
     lab=$(pad "$label" 11)
-    room=$((BOX_IN - 14))
+    prefix="  ${lab}"
+    if [[ -n "$fs" && "$fs" != "?" ]]; then
+        fs_show=$(pad "$fs" 8)
+        prefix+=" ${fs_show}"
+    fi
+    room=$((BOX_IN - $(char_len "$prefix") - 1))
     if (( room < 8 )); then
         room=8
     fi
@@ -1887,7 +1895,7 @@ home_meter() {
     if [[ -n "$extra" ]] && (( need + 2 + $(char_len "$extra") <= room )); then
         use_extra=1
     fi
-    plain="  ${lab} ${pair_show}"
+    plain="${prefix} ${pair_show}"
     if (( use_bar )); then
         plain+="  ${bar}"
     fi
@@ -1896,13 +1904,17 @@ home_meter() {
     fi
     if (( $(char_len "$plain") > BOX_IN )); then
         pair_show=$(clip_vis "$pair" "$room")
-        plain="  ${lab} ${pair_show}"
+        plain="${prefix} ${pair_show}"
         use_bar=0
         use_extra=0
     fi
     colored=$plain
     if (( USE_COLOR )); then
-        colored=$(printf '  %s%s%s %s%s%s' "$DIM" "$lab" "$RST" "$pcolor" "$pair_show" "$RST")
+        colored=$(printf '  %s%s%s' "$DIM" "$lab" "$RST")
+        if [[ -n "$fs_show" ]]; then
+            colored+=$(printf ' %s%s%s' "$C_HOST" "$fs_show" "$RST")
+        fi
+        colored+=$(printf ' %s%s%s' "$pcolor" "$pair_show" "$RST")
         if (( use_bar )); then
             colored+=$(printf '  %s[%s%s%s%s%s]%s' "$DIM" "$RST" "$bar_col" "$bar_f" "$DIM" "$bar_e" "$RST")
         fi
@@ -1913,15 +1925,34 @@ home_meter() {
     box_emit "$plain" "$colored" 0
 }
 
+home_split() {
+    local title="$1" tlen dash_n dashes plain colored
+    tlen=$(char_len "$title")
+    dash_n=$((BOX_IN - tlen - 6))
+    if (( dash_n < 2 )); then
+        dash_n=2
+    fi
+    dashes=$(rule "$dash_n")
+    plain=$(printf '  ── %s %s' "$title" "$dashes")
+    colored=$plain
+    if (( USE_COLOR )); then
+        colored=$(printf '  %s── %s%s%s %s%s' \
+            "$DIM" "$RST${C_HOST}" "$title" "$RST" "$DIM" "${dashes}${RST}")
+    fi
+    box_emit "$plain" "$colored" 0
+}
+
 home_service() {
-    local role="$1" state="$2" pid="$3"
-    local word scol role_f state_f plain colored
+    local role="$1" state="$2" pid="$3" sid="${4:-}"
+    local word scol role_f state_f pid_f plain colored
     word=$(svc_word "$state")
     scol=$(status_color "$state")
-    role_f=$(pad "$role" 16)
-    state_f=$(pad "$word" 12)
+    role_f=$(pad "$role" 12)
+    state_f=$(pad "$word" 9)
     [[ -n "$pid" ]] || pid="—"
-    plain=$(printf '  ● %s%sPID %s' "$role_f" "$state_f" "$pid")
+    [[ -n "$sid" ]] || sid="—"
+    pid_f=$(pad "$pid" 8)
+    plain=$(printf '  ● %s%sPID %s%s' "$role_f" "$state_f" "$pid_f" "$sid")
     if (( $(char_len "$plain") > BOX_IN )); then
         plain=$(clip_vis "$plain" "$BOX_IN")
         colored=$plain
@@ -1933,11 +1964,11 @@ home_service() {
     fi
     colored=$plain
     if (( USE_COLOR )); then
-        colored=$(printf '  %s●%s %s%s%s%s%s%s%sPID %s%s' \
+        colored=$(printf '  %s●%s %s%s%s%s%s%s%sPID %s%s%s' \
             "$scol" "$RST" \
             "$C_TEXT" "$role_f" "$RST" \
             "$scol" "$state_f" "$RST" \
-            "$DIM" "$pid" "$RST")
+            "$DIM" "$pid_f" "$sid" "$RST")
     fi
     box_emit "$plain" "$colored" 0
 }
@@ -2002,12 +2033,12 @@ home_prompt() {
 }
 
 draw_home() {
-    local typed="${1:-}" i=1 role extra ip name state pid mnt used avail size
+    local typed="${1:-}" i=1 role extra ip name state pid mnt fs used avail size
     local mark cpu model pct="" free="" pair label count noun
     term_size
     BOX_IN=$((TERM_COLS - 3))
-    if (( BOX_IN > 62 )); then
-        BOX_IN=62
+    if (( BOX_IN > 78 )); then
+        BOX_IN=78
     fi
     if (( BOX_IN < 36 )); then
         BOX_IN=36
@@ -2058,6 +2089,7 @@ draw_home() {
     else
         home_kv "MEMORY" "не найдена" "$C_WARN"
     fi
+    home_split "DISK"
     if [[ ${#disk_mnt[@]} -eq 0 ]]; then
         home_kv "DISK" "не распознаны" "$C_WARN"
     else
@@ -2070,6 +2102,8 @@ draw_home() {
             [[ -n "$avail" ]] || avail="—"
             [[ -n "$size" ]] || size="—"
             label=$(mount_label "$mnt")
+            fs=${disk_fs[$i]:-—}
+            [[ -n "$fs" && "$fs" != "?" ]] || fs="—"
             pair=$(size_ratio "$used" "$size")
             free=""
             if [[ "$avail" != "—" && -n "$avail" ]]; then
@@ -2080,7 +2114,7 @@ draw_home() {
                 pct=${disk_pct[$i]%%%}
                 pct=${pct%.*}
             fi
-            home_meter "$label" "$pair" "$pct" "$free"
+            home_meter "$label" "$pair" "$pct" "$free" "$fs"
         done
     fi
     box_emit "" "" 0
@@ -2094,7 +2128,7 @@ draw_home() {
             [[ -n "$role" ]] || role="прочее"
             state=${svc_state[$i]:-?}
             pid=${svc_pid[$i]:-—}
-            home_service "$role" "$state" "$pid"
+            home_service "$role" "$state" "$pid" "${svc_id[$i]:-без id}"
         done < <(sorted_service_indexes)
     fi
     box_emit "" "" 0
@@ -2106,7 +2140,6 @@ draw_home() {
     i=1
     for role in "${ROLE_MENU[@]}"; do
         extra=""
-        [[ "$role" == "core" ]] && extra="   · дольше"
         mark=0
         menu_hit "$typed" "$role" "$i" && mark=1
         count=$(role_count "$role")
