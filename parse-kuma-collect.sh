@@ -11,7 +11,7 @@ case "${LC_ALL:-${LANG:-C}}" in
     *) export LC_ALL=C.UTF-8 ;;
 esac
 
-PARSER_VERSION="0.5.6"
+PARSER_VERSION="0.5.7"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 AWK_PROG="$SCRIPT_DIR/kuma-log-errors.awk"
 EXTRACT_PROG="$SCRIPT_DIR/kuma-log-extract.py"
@@ -367,6 +367,14 @@ status_color() {
     elif [[ "$s" == *failed* || "$s" == *dead* || "$s" == *inactive* ]]; then printf '%s' "$C_BAD"
     else printf '%s' "$C_WARN"
     fi
+}
+
+pressure_color() {
+    case "$1" in
+        ok) printf '%s' "$C_OK" ;;
+        warn) printf '%s' "$C_WARN" ;;
+        *) printf '%s' "$C_BAD" ;;
+    esac
 }
 
 level_color() {
@@ -832,6 +840,69 @@ load_mem() {
     fi
 }
 
+load_top_pressure() {
+    HOST_LA1="" HOST_LA5="" HOST_LA15="" HOST_WA=""
+    local file="$1" line
+    [[ -n "$file" && -f "$file" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line=${line%$'\r'}
+        if [[ -z "$HOST_LA1" && "$line" =~ [Ll]oad\ [Aa]verages?:[[:space:]]*([0-9]+([.,][0-9]+)?)[,[:space:]]+([0-9]+([.,][0-9]+)?)[,[:space:]]+([0-9]+([.,][0-9]+)?) ]]; then
+            HOST_LA1=${BASH_REMATCH[1]//,/.}
+            HOST_LA5=${BASH_REMATCH[3]//,/.}
+            HOST_LA15=${BASH_REMATCH[5]//,/.}
+        fi
+        if [[ -z "$HOST_WA" && "$line" == *[Cc]pu* && "$line" =~ ([0-9]+([.,][0-9]+)?)[[:space:]]+%?wa ]]; then
+            HOST_WA=${BASH_REMATCH[1]//,/.}
+        fi
+        [[ -n "$HOST_LA1" && -n "$HOST_WA" ]] && break
+    done < "$file"
+}
+
+fill_pressure() {
+    PRESS_LA_VALUE="" PRESS_LA_TAIL="" PRESS_LA_COLOR="$C_TEXT"
+    PRESS_WA_VALUE="" PRESS_WA_COLOR="$C_TEXT"
+    local band per word
+    if [[ -n "${HOST_LA1:-}" ]]; then
+        if [[ "${HOST_CPU_N:-0}" -eq 0 ]]; then
+            PRESS_LA_VALUE="$HOST_LA1"
+            PRESS_LA_COLOR="$C_WARN"
+            PRESS_LA_TAIL="нет ядер"
+        else
+            per=$(awk -v la="$HOST_LA1" -v n="$HOST_CPU_N" 'BEGIN { printf "%.2f", (la + 0) / (n + 0) }')
+            band=$(awk -v x="$per" 'BEGIN {
+                x += 0
+                if (x < 0.7) print "ok"
+                else if (x < 1) print "warn"
+                else if (x <= 2) print "high"
+                else print "bad"
+            }')
+            case "$band" in
+                ok) word="" ;;
+                warn) word="занята" ;;
+                high) word="очередь" ;;
+                *) word="перегрузка" ;;
+            esac
+            PRESS_LA_COLOR=$(pressure_color "$band")
+            if [[ -n "$word" ]]; then
+                PRESS_LA_VALUE="${per}/ядро  ${word}"
+            else
+                PRESS_LA_VALUE="${per}/ядро"
+            fi
+            PRESS_LA_TAIL="${HOST_LA1}  ${HOST_LA5}  ${HOST_LA15}"
+        fi
+    fi
+    if [[ -n "${HOST_WA:-}" ]]; then
+        band=$(awk -v x="$HOST_WA" 'BEGIN {
+            x += 0
+            if (x < 10) print "ok"
+            else if (x > 20) print "bad"
+            else print "warn"
+        }')
+        PRESS_WA_COLOR=$(pressure_color "$band")
+        PRESS_WA_VALUE="${HOST_WA}%"
+    fi
+}
+
 emit_mem_cpu() {
     local cpu
     if [[ -z "${HOST_MEM_TEXT:-}" ]]; then
@@ -846,6 +917,13 @@ emit_mem_cpu() {
         field "$C_HOST" "CPU" "${cpu}${HOST_CPU_MODEL:+  ${HOST_CPU_MODEL}}"
     else
         field "$C_HOST" "CPU" "${HOST_CPU_N}${HOST_CPU_MODEL:+  ${HOST_CPU_MODEL}}"
+    fi
+    fill_pressure
+    if [[ -n "$PRESS_LA_VALUE" ]]; then
+        field "$C_HOST" "LA" "${PRESS_LA_VALUE}${PRESS_LA_TAIL:+  ${PRESS_LA_TAIL}}" "$PRESS_LA_COLOR"
+    fi
+    if [[ -n "$PRESS_WA_VALUE" ]]; then
+        field "$C_HOST" "WA" "$PRESS_WA_VALUE" "$PRESS_WA_COLOR"
     fi
 }
 
@@ -1852,6 +1930,34 @@ home_kv() {
     box_emit "$plain" "$colored" 0
 }
 
+home_metric() {
+    local label="$1" value="$2" vcolor="$3" tail="${4:-}"
+    local lab plain colored
+    lab=$(pad "$label" 11)
+    if [[ -n "$tail" ]]; then
+        plain="  ${lab} ${value}  ${tail}"
+    else
+        plain="  ${lab} ${value}"
+    fi
+    if (( $(char_len "$plain") > BOX_IN )); then
+        plain=$(clip_vis "$plain" "$BOX_IN")
+        colored=$plain
+        if (( USE_COLOR )); then
+            colored="${vcolor}${plain}${RST}"
+        fi
+        box_emit "$plain" "$colored" 0
+        return
+    fi
+    colored=$plain
+    if (( USE_COLOR )); then
+        colored=$(printf '  %s%s%s %s%s%s' "$DIM" "$lab" "$RST" "$vcolor" "$value" "$RST")
+        if [[ -n "$tail" ]]; then
+            colored+=$(printf '  %s%s%s' "$DIM" "$tail" "$RST")
+        fi
+    fi
+    box_emit "$plain" "$colored" 0
+}
+
 home_meter() {
     local label="$1" pair="$2" pct="$3" extra="${4:-}" fs="${5:-}"
     local lab fs_show="" room pair_show bar="" bar_f="" bar_e="" filled=0 i
@@ -2081,6 +2187,13 @@ draw_home() {
         cpu="${HOST_CPU_N} cores"
         [[ -n "$model" ]] && cpu+="   ${model}"
         home_kv "CPU" "$cpu"
+    fi
+    fill_pressure
+    if [[ -n "$PRESS_LA_VALUE" ]]; then
+        home_metric "LA" "$PRESS_LA_VALUE" "$PRESS_LA_COLOR" "$PRESS_LA_TAIL"
+    fi
+    if [[ -n "$PRESS_WA_VALUE" ]]; then
+        home_metric "WA" "$PRESS_WA_VALUE" "$PRESS_WA_COLOR"
     fi
     if mem_card; then
         home_meter "MEMORY" "$MEM_PAIR" "$MEM_PCT" "$MEM_FREE"
@@ -3028,6 +3141,7 @@ main() {
         load_cpu_sysctl "${FILE_SYSCTL:-}"
     fi
     load_mem "${FILE_TOP:-}" "${FILE_MEMORY:-}"
+    load_top_pressure "${FILE_TOP:-}"
     load_version "${FILE_VERSION:-}"
     load_services "${FILE_SERVICES:-}"
     load_disks "${FILE_HDD:-}"
