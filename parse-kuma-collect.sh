@@ -11,7 +11,7 @@ case "${LC_ALL:-${LANG:-C}}" in
     *) export LC_ALL=C.UTF-8 ;;
 esac
 
-PARSER_VERSION="0.5.7"
+PARSER_VERSION="0.5.11"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 AWK_PROG="$SCRIPT_DIR/kuma-log-errors.awk"
 EXTRACT_PROG="$SCRIPT_DIR/kuma-log-extract.py"
@@ -27,6 +27,7 @@ SUFFIX_SYSCTL="environment/sysctl.txt"
 SUFFIX_TOP="environment/top.txt"
 SUFFIX_MEMORY="environment/memory.txt"
 SUFFIX_LOGS="kaspersky/KUMA/logs.tar"
+SUFFIX_KESL="kaspersky/KESL/appinfo.txt"
 
 TOP=10
 INCLUDE_WARN=0
@@ -1355,6 +1356,72 @@ print_disks() {
     emit_disk_rows
 }
 
+kesl_is_status() {
+    local v="${1,,}"
+    case "$v" in
+        "available and "*|unavailable*|disabled|"not supported"*|stopped|running|started) return 0 ;;
+        "задача доступна и "*|недоступн*|не\ поддерживается\ лицензией|остановлен*|выключен*) return 0 ;;
+    esac
+    return 1
+}
+
+kesl_status_color() {
+    local v="${1,,}"
+    case "$v" in
+        "available and running"|running|started) printf '%s' "$C_OK" ;;
+        "задача доступна и выполняется") printf '%s' "$C_OK" ;;
+        "available and stopped"|stopped|disabled) printf '%s' "$C_WARN" ;;
+        "задача доступна и не выполняется"|остановлен*|выключен*) printf '%s' "$C_WARN" ;;
+        *) printf '%s' "$C_BAD" ;;
+    esac
+}
+
+load_kesl() {
+    KESL_NAME=()
+    KESL_STATUS=()
+    KESL_PRESENT=0
+    local file="$1" line key val
+    [[ -n "$file" && -f "$file" ]] || return 0
+    KESL_PRESENT=1
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line=${line%$'\r'}
+        [[ "$line" == *:* ]] || continue
+        key=${line%%:*}
+        val=${line#*:}
+        key=${key#"${key%%[![:space:]]*}"}
+        key=${key%"${key##*[![:space:]]}"}
+        val=${val#"${val%%[![:space:]]*}"}
+        val=${val%"${val##*[![:space:]]}"}
+        [[ -n "$key" && -n "$val" ]] || continue
+        kesl_is_status "$val" || continue
+        KESL_NAME+=("$key")
+        KESL_STATUS+=("$val")
+    done < "$file"
+}
+
+print_kesl() {
+    (( ${KESL_PRESENT:-0} )) || return 0
+    local i color plain colored
+    section "$C_SVC" "KESL" "$SUFFIX_KESL"
+    emit "  Статусы модулей из appinfo.txt."
+    emit ""
+    if [[ ${#KESL_NAME[@]} -eq 0 ]]; then
+        emit "  Модули не распознаны."
+        return
+    fi
+    for i in "${!KESL_NAME[@]}"; do
+        color=$(kesl_status_color "${KESL_STATUS[$i]}")
+        plain=$(printf '  %s  %s' "${KESL_NAME[$i]}" "${KESL_STATUS[$i]}")
+        colored=$plain
+        if (( USE_COLOR )); then
+            colored=$(printf '  %s%s%s  %s%s%s' \
+                "$C_TEXT" "${KESL_NAME[$i]}" "$RST" \
+                "$color" "${KESL_STATUS[$i]}" "$RST")
+        fi
+        view_put "$plain" "$colored"
+    done
+}
+
 print_services() {
     section "$C_SVC" "Службы KUMA" "$SUFFIX_SERVICES"
     emit "  Берутся только заголовки systemctl status из services.txt. Строки журнала под блоком службой не считаются."
@@ -2079,6 +2146,47 @@ home_service() {
     box_emit "$plain" "$colored" 0
 }
 
+home_kesl() {
+    local name="$1" status="$2"
+    local color plain colored room gap nlen slen
+    color=$(kesl_status_color "$status")
+    nlen=$(char_len "$name")
+    slen=$(char_len "$status")
+    room=$((BOX_IN - 2))
+    if (( room < 1 )); then
+        room=1
+    fi
+    if (( nlen + 2 + slen <= room )); then
+        gap=$((room - nlen - slen))
+        plain=$(printf '  %s%*s%s' "$name" "$gap" "" "$status")
+        colored=$plain
+        if (( USE_COLOR )); then
+            colored=$(printf '  %s%s%s%*s%s%s%s' \
+                "$C_TEXT" "$name" "$RST" "$gap" "" "$color" "$status" "$RST")
+        fi
+        box_emit "$plain" "$colored" 0
+        return
+    fi
+    plain=$(printf '  %s' "$name")
+    if (( $(char_len "$plain") > BOX_IN )); then
+        plain=$(clip_vis "$plain" "$BOX_IN")
+    fi
+    colored=$plain
+    if (( USE_COLOR )); then
+        colored=$(printf '%s%s%s' "$C_TEXT" "$plain" "$RST")
+    fi
+    box_emit "$plain" "$colored" 0
+    plain=$(printf '    %s' "$status")
+    if (( $(char_len "$plain") > BOX_IN )); then
+        plain=$(clip_vis "$plain" "$BOX_IN")
+    fi
+    colored=$plain
+    if (( USE_COLOR )); then
+        colored=$(printf '%s%s%s' "$color" "$plain" "$RST")
+    fi
+    box_emit "$plain" "$colored" 0
+}
+
 home_menu_row() {
     local mark="$1" num="$2" title="$3" tail="$4" extra="$5"
     local num_f title_f plain colored
@@ -2243,6 +2351,18 @@ draw_home() {
             pid=${svc_pid[$i]:-—}
             home_service "$role" "$state" "$pid" "${svc_id[$i]:-без id}"
         done < <(sorted_service_indexes)
+    fi
+    if (( ${KESL_PRESENT:-0} )); then
+        box_emit "" "" 0
+        box_banner "├" "┤" "KESL"
+        box_emit "" "" 0
+        if [[ ${#KESL_NAME[@]} -eq 0 ]]; then
+            home_kv "KESL" "модули не распознаны" "$C_WARN"
+        else
+            for i in "${!KESL_NAME[@]}"; do
+                home_kesl "${KESL_NAME[$i]}" "${KESL_STATUS[$i]}"
+            done
+        fi
     fi
     box_emit "" "" 0
     box_banner "├" "┤" "LOG ANALYZER"
@@ -3099,6 +3219,7 @@ main() {
         FILE_SYSCTL=$(find_suffix "$root" "$SUFFIX_SYSCTL")
         FILE_TOP=$(find_suffix "$root" "$SUFFIX_TOP")
         FILE_MEMORY=$(find_suffix "$root" "$SUFFIX_MEMORY")
+        FILE_KESL=$(find_suffix "$root" "$SUFFIX_KESL")
         LOGS_TAR=$(find_suffix "$root" "$SUFFIX_LOGS")
     }
 
@@ -3108,7 +3229,8 @@ main() {
     else
         debug_stage "сводка"
         progress "Распаковываю сводку одним проходом. logs.tar откроется только если смотреть логи."
-        tar -xzf "$ARCHIVE" -C "$work" --wildcards --no-anchored \
+        local tar_err
+        tar_err=$(tar -xzf "$ARCHIVE" -C "$work" --wildcards --no-anchored \
             '*/environment/hostname.txt' \
             '*/environment/hdd.txt' \
             '*/environment/ipa.txt' \
@@ -3118,7 +3240,12 @@ main() {
             '*/environment/top.txt' \
             '*/environment/memory.txt' \
             '*/kaspersky/KUMA/services.txt' \
-            '*/kaspersky/KUMA/execvers.txt' || true
+            '*/kaspersky/KUMA/execvers.txt' \
+            '*/kaspersky/KESL/appinfo.txt' 2>&1 >/dev/null) || true
+        if [[ -n "$tar_err" ]]; then
+            tar_err=$(printf '%s\n' "$tar_err" | grep -v -e 'Not found in archive' -e 'Exiting with failure status due to previous errors' || true)
+            [[ -n "$tar_err" ]] && printf '%s\n' "$tar_err" >&2
+        fi
         locate_inputs "$work"
         debug_stage "сводка-готова"
         [[ -n "${FILE_HOSTNAME:-}" ]] || die "в архиве нет $SUFFIX_HOSTNAME — это не похоже на коллект KUMA"
@@ -3144,6 +3271,7 @@ main() {
     load_top_pressure "${FILE_TOP:-}"
     load_version "${FILE_VERSION:-}"
     load_services "${FILE_SERVICES:-}"
+    load_kesl "${FILE_KESL:-}"
     load_disks "${FILE_HDD:-}"
     capture_mount_total "${FILE_HDD:-}"
     summarize_disks
@@ -3158,6 +3286,7 @@ main() {
     print_disks
     print_version
     print_services
+    print_kesl
     run_logs
 
     emit ""
