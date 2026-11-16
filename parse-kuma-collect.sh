@@ -11,7 +11,7 @@ case "${LC_ALL:-${LANG:-C}}" in
     *) export LC_ALL=C.UTF-8 ;;
 esac
 
-PARSER_VERSION="0.5.11"
+PARSER_VERSION="0.5.16"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 AWK_PROG="$SCRIPT_DIR/kuma-log-errors.awk"
 EXTRACT_PROG="$SCRIPT_DIR/kuma-log-extract.py"
@@ -1078,8 +1078,16 @@ load_disks() {
         disk_mnt+=("$mnt"); disk_fs+=("$fs"); disk_dev+=("$dev")
         disk_size+=("$size"); disk_used+=("$used"); disk_avail+=("$avail"); disk_pct+=("$pct")
     done < <(awk '
+        function is_s3(dev, fs) {
+            if (fs ~ /s3/ || fs ~ /goofys/ || fs ~ /geesefs/) return 1
+            if (dev ~ /^s3fs/ || dev ~ /^s3:/ || dev ~ /^mount-s3/ || dev ~ /^mountpoint-s3/) return 1
+            if (dev ~ /^goofys/ || dev ~ /^geesefs/) return 1
+            return 0
+        }
         function is_disk(dev, fs) {
             if (fs ~ /^(ext[234]|xfs|btrfs|zfs|vfat|fat32|ntfs|fuseblk|reiserfs|f2fs|apfs|hfs|ufs|ffs|msdos|exfat)$/) return 1
+            if (fs ~ /^(nfs|nfs4|cifs|smb3|smbfs)$/) return 1
+            if (is_s3(dev, fs)) return 1
             return 0
         }
         function mount_key(m) { return (m == "/" ? "0/" : "1" m) }
@@ -1136,6 +1144,7 @@ load_disks() {
                 for (i = 1; i <= NF; i++) if ($i ~ /^[0-9]+%$/) { p = i; break }
                 if (!p || p < 4) next
                 size = $(p - 3); used = $(p - 2); avail = $(p - 1); pct = $p
+                gsub(/,/, ".", size); gsub(/,/, ".", used); gsub(/,/, ".", avail)
                 lastp = p
                 for (i = p; i <= NF; i++) if ($i ~ /%$/) lastp = i
                 if (lastp >= NF) next
@@ -1156,7 +1165,7 @@ load_disks() {
                 for (m in df_size) {
                     dev = df_dev[m]
                     if (dev ~ /^(tmpfs|devtmpfs|devfs|udev|none|overlay|map|autofs|procfs|linprocfs|fdescfs|squashfs)/) continue
-                    if (dev !~ /^\//) continue
+                    if (!is_s3(dev, "") && dev !~ /^\// && dev !~ /:/) continue
                     fs_of[m] = "?"
                     dev_of[m] = dev
                     order[++nd] = m
@@ -1299,32 +1308,82 @@ print_host() {
     emit_mem_cpu
 }
 
+disk_load_row() {
+    local i="$1"
+    mnt=${disk_mnt[$i]}
+    dev=${disk_dev[$i]:-—}
+    [[ -n "$dev" && "$dev" != "?" ]] || dev="—"
+    fs=${disk_fs[$i]:-—}
+    [[ -n "$fs" && "$fs" != "?" ]] || fs="—"
+    used=${disk_used[$i]:-—}
+    avail=${disk_avail[$i]:-—}
+    size=${disk_size[$i]:-—}
+    [[ -n "$used" ]] || used="—"
+    [[ -n "$avail" ]] || avail="—"
+    [[ -n "$size" ]] || size="—"
+    pair=$(size_ratio "$used" "$size")
+    free=""
+    if [[ "$avail" != "—" && -n "$avail" ]]; then
+        free="free $(size_phrase "$avail")"
+    fi
+    pct=""
+    if [[ "${disk_pct[$i]:-}" =~ ^[0-9]+([.][0-9]+)?%?$ ]]; then
+        pct=${disk_pct[$i]%%%}
+        pct=${pct%.*}
+    fi
+}
+
+disk_measure() {
+    DISK_W_DEV=1 DISK_W_MNT=1 DISK_W_FS=1 DISK_W_PAIR=1
+    DISK_W_AVAIL=1 DISK_W_USED=1 DISK_W_SIZE=1
+    local i n
+    [[ ${#disk_mnt[@]} -gt 0 ]] || return 0
+    for i in "${!disk_mnt[@]}"; do
+        disk_load_row "$i"
+        n=$(char_len "$dev")
+        if (( n > DISK_W_DEV )); then DISK_W_DEV=$n; fi
+        n=$(char_len "$mnt")
+        if (( n > DISK_W_MNT )); then DISK_W_MNT=$n; fi
+        n=$(char_len "$fs")
+        if (( n > DISK_W_FS )); then DISK_W_FS=$n; fi
+        n=$(char_len "$pair")
+        if (( n > DISK_W_PAIR )); then DISK_W_PAIR=$n; fi
+        n=$(char_len "$avail")
+        if (( n > DISK_W_AVAIL )); then DISK_W_AVAIL=$n; fi
+        n=$(char_len "$used")
+        if (( n > DISK_W_USED )); then DISK_W_USED=$n; fi
+        n=$(char_len "$size")
+        if (( n > DISK_W_SIZE )); then DISK_W_SIZE=$n; fi
+    done
+}
+
 emit_disk_rows() {
-    local i mnt fs used avail size tag plain colored
+    local i mnt dev fs used avail size pair free pct tag plain colored
+    local dev_f mnt_f fs_f avail_f used_f size_f
     if [[ ${#disk_mnt[@]} -eq 0 ]]; then
         emit "  дисковые точки не распознаны"
         return 0
     fi
+    disk_measure
     for i in "${!disk_mnt[@]}"; do
-        mnt=${disk_mnt[$i]}
-        fs=${disk_fs[$i]:-—}
-        [[ -n "$fs" && "$fs" != "?" ]] || fs="—"
-        used=${disk_used[$i]:-—}
-        avail=${disk_avail[$i]:-—}
-        size=${disk_size[$i]:-—}
-        [[ -n "$used" ]] || used="—"
-        [[ -n "$avail" ]] || avail="—"
-        [[ -n "$size" ]] || size="—"
+        disk_load_row "$i"
         tag=""
         if [[ "$mnt" == "/kuma" || "$mnt" == /opt/kaspersky || "$mnt" == /opt/kaspersky/* ]]; then
             tag="   данные KUMA"
         fi
-        plain=$(printf '  %-16s %-8s свободно %-8s занято %-8s всего %-8s%s' "$mnt" "$fs" "$avail" "$used" "$size" "$tag")
+        dev_f=$(pad "$dev" "$DISK_W_DEV")
+        mnt_f=$(pad "$mnt" "$DISK_W_MNT")
+        fs_f=$(pad "$fs" "$DISK_W_FS")
+        avail_f=$(pad "$avail" "$DISK_W_AVAIL")
+        used_f=$(pad "$used" "$DISK_W_USED")
+        size_f=$(pad "$size" "$DISK_W_SIZE")
+        plain=$(printf '  %s  %s  %s  свободно %s  занято %s  всего %s%s' \
+            "$dev_f" "$mnt_f" "$fs_f" "$avail_f" "$used_f" "$size_f" "$tag")
         colored=$plain
         if (( USE_COLOR )); then
-            colored=$(printf '  %s%-16s%s %s%-8s%s свободно %-8s занято %-8s всего %-8s%s%s%s' \
-                "$C_DISK" "$mnt" "$RST" "$C_HOST" "$fs" "$RST" \
-                "$avail" "$used" "$size" "$BOLD$C_DISK" "$tag" "$RST")
+            colored=$(printf '  %s%s%s  %s%s%s  %s%s%s  свободно %s  занято %s  всего %s%s%s%s' \
+                "$C_TEXT" "$dev_f" "$RST" "$C_DISK" "$mnt_f" "$RST" "$C_HOST" "$fs_f" "$RST" \
+                "$avail_f" "$used_f" "$size_f" "$BOLD$C_DISK" "$tag" "$RST")
         fi
         view_put "$plain" "$colored"
     done
@@ -1351,7 +1410,7 @@ print_disks() {
         emit "  Файл не найден."
         return
     fi
-    emit "  По каждой дисковой точке: тип ФС, свободно, занято, всего. proc, sysfs, tmpfs и snap не показаны."
+    emit "  По каждой дисковой точке: устройство, тип ФС, свободно, занято, всего. proc, sysfs, tmpfs и snap не показаны. nfs, cifs и S3 показаны."
     emit ""
     emit_disk_rows
 }
@@ -2098,6 +2157,77 @@ home_meter() {
     box_emit "$plain" "$colored" 0
 }
 
+disk_bar() {
+    local pct="$1" filled=0 i
+    DISK_BAR=""
+    DISK_BAR_F=""
+    DISK_BAR_E=""
+    [[ "$pct" =~ ^[0-9]+$ ]] || return 0
+    filled=$(( (pct * 10 + 50) / 100 ))
+    if (( pct > 0 && filled == 0 )); then
+        filled=1
+    fi
+    if (( filled > 10 )); then
+        filled=10
+    fi
+    for ((i = 0; i < filled; i++)); do DISK_BAR_F+="█"; done
+    for ((i = filled; i < 10; i++)); do DISK_BAR_E+="░"; done
+    DISK_BAR="[${DISK_BAR_F}${DISK_BAR_E}]"
+    printf '%s' "$DISK_BAR"
+}
+
+disk_row_text() {
+    local dev_f mnt_f fs_f pair_f bar text
+    dev_f=$(pad "$1" "${DISK_W_DEV:-1}")
+    mnt_f=$(pad "$2" "${DISK_W_MNT:-1}")
+    fs_f=$(pad "$3" "${DISK_W_FS:-1}")
+    pair_f=$(pad "$4" "${DISK_W_PAIR:-1}")
+    bar=$(disk_bar "$5")
+    [[ -n "$bar" ]] || bar="            "
+    text="  ${dev_f}  ${mnt_f}  ${fs_f}  ${pair_f}  ${bar}"
+    [[ -n "${6:-}" ]] && text+="  ${6}"
+    printf '%s' "$text"
+}
+
+home_disk() {
+    local dev="$1" mnt="$2" fs="$3" pair="$4" pct="$5" free="${6:-}"
+    local pcolor="$C_TEXT" bar_col="$C_OK" plain colored
+    local dev_f mnt_f fs_f pair_f
+    disk_bar "$pct" >/dev/null
+    if [[ "$pct" =~ ^[0-9]+$ ]]; then
+        if (( pct >= 90 )); then
+            pcolor="$C_BAD"
+            bar_col="$C_BAD"
+        elif (( pct >= 75 )); then
+            pcolor="$C_WARN"
+            bar_col="$C_WARN"
+        fi
+    fi
+    dev_f=$(pad "$dev" "${DISK_W_DEV:-1}")
+    mnt_f=$(pad "$mnt" "${DISK_W_MNT:-1}")
+    fs_f=$(pad "$fs" "${DISK_W_FS:-1}")
+    pair_f=$(pad "$pair" "${DISK_W_PAIR:-1}")
+    plain=$(disk_row_text "$dev" "$mnt" "$fs" "$pair" "$pct" "$free")
+    colored=$plain
+    if (( USE_COLOR )); then
+        colored=$(printf '  %s%s%s  %s%s%s  %s%s%s  %s%s%s  ' \
+            "$C_TEXT" "$dev_f" "$RST" \
+            "$C_DISK" "$mnt_f" "$RST" \
+            "$C_HOST" "$fs_f" "$RST" \
+            "$pcolor" "$pair_f" "$RST")
+        if [[ -n "$DISK_BAR" ]]; then
+            colored+=$(printf '%s[%s%s%s%s%s]%s' \
+                "$DIM" "$RST" "$bar_col" "$DISK_BAR_F" "$DIM" "$DISK_BAR_E" "$RST")
+        else
+            colored+="            "
+        fi
+        if [[ -n "$free" ]]; then
+            colored+=$(printf '  %s%s%s' "$DIM" "$free" "$RST")
+        fi
+    fi
+    box_emit "$plain" "$colored" 0
+}
+
 home_split() {
     local title="$1" tlen dash_n dashes plain colored
     tlen=$(char_len "$title")
@@ -2247,12 +2377,25 @@ home_prompt() {
 }
 
 draw_home() {
-    local typed="${1:-}" i=1 role extra ip name state pid mnt fs used avail size
+    local typed="${1:-}" i=1 role extra ip name state pid mnt dev fs used avail size
     local mark cpu model pct="" free="" pair label count noun
+    local need=78 dlen text
     term_size
+    disk_measure
+    if [[ ${#disk_mnt[@]} -gt 0 ]]; then
+        for i in "${!disk_mnt[@]}"; do
+            disk_load_row "$i"
+            text=$(disk_row_text "$dev" "$mnt" "$fs" "$pair" "$pct" "$free")
+            dlen=$(char_len "$text")
+            if (( dlen > need )); then
+                need=$dlen
+            fi
+            break
+        done
+    fi
     BOX_IN=$((TERM_COLS - 3))
-    if (( BOX_IN > 78 )); then
-        BOX_IN=78
+    if (( BOX_IN > need )); then
+        BOX_IN=$need
     fi
     if (( BOX_IN < 36 )); then
         BOX_IN=36
@@ -2315,27 +2458,8 @@ draw_home() {
         home_kv "DISK" "не распознаны" "$C_WARN"
     else
         for i in "${!disk_mnt[@]}"; do
-            mnt=${disk_mnt[$i]}
-            used=${disk_used[$i]:-—}
-            avail=${disk_avail[$i]:-—}
-            size=${disk_size[$i]:-—}
-            [[ -n "$used" ]] || used="—"
-            [[ -n "$avail" ]] || avail="—"
-            [[ -n "$size" ]] || size="—"
-            label=$(mount_label "$mnt")
-            fs=${disk_fs[$i]:-—}
-            [[ -n "$fs" && "$fs" != "?" ]] || fs="—"
-            pair=$(size_ratio "$used" "$size")
-            free=""
-            if [[ "$avail" != "—" && -n "$avail" ]]; then
-                free="free $(size_phrase "$avail")"
-            fi
-            pct=""
-            if [[ "${disk_pct[$i]:-}" =~ ^[0-9]+([.][0-9]+)?%?$ ]]; then
-                pct=${disk_pct[$i]%%%}
-                pct=${pct%.*}
-            fi
-            home_meter "$label" "$pair" "$pct" "$free" "$fs"
+            disk_load_row "$i"
+            home_disk "$dev" "$mnt" "$fs" "$pair" "$pct" "$free"
         done
     fi
     box_emit "" "" 0
