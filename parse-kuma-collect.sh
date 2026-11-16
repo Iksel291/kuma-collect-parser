@@ -11,7 +11,7 @@ case "${LC_ALL:-${LANG:-C}}" in
     *) export LC_ALL=C.UTF-8 ;;
 esac
 
-PARSER_VERSION="0.5.16"
+PARSER_VERSION="0.5.19"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 AWK_PROG="$SCRIPT_DIR/kuma-log-errors.awk"
 EXTRACT_PROG="$SCRIPT_DIR/kuma-log-extract.py"
@@ -28,6 +28,8 @@ SUFFIX_TOP="environment/top.txt"
 SUFFIX_MEMORY="environment/memory.txt"
 SUFFIX_LOGS="kaspersky/KUMA/logs.tar"
 SUFFIX_KESL="kaspersky/KESL/appinfo.txt"
+SUFFIX_KESL_EX="kaspersky/KESL/exset.txt"
+SUFFIX_KESL_EXP="kaspersky/KESL/expset.txt"
 
 TOP=10
 INCLUDE_WARN=0
@@ -37,6 +39,9 @@ DEBUG_PID=""
 COLOR_FLAG="auto"
 OUT=""
 LOGS_MODE="ask"
+REPORT=0
+REPORT_QUIET=0
+LAUNCH_DIR=""
 ARCHIVE=""
 
 USE_COLOR=0
@@ -82,6 +87,8 @@ usage() {
   --logs core,storage разобрать только эти роли, без вопросов
   --include-warn      добавить warn/warning в рейтинг ошибок
   --out FILE          дополнительно записать отчёт без цветов
+  --report            записать первую страницу в txt в текущую папку
+  --report=all        в тот же файл — всё, что скрипт разобрал, включая логи
   --color / --no-color
   --keep-work         не удалять временный каталог
   --debug FILE        писать этапы и память в FILE раз в секунду
@@ -158,6 +165,10 @@ view_put() {
     if (( UI_CAPTURE )); then
         VIEW_PLAIN+=("$plain")
         VIEW_DRAW+=("$colored")
+        record "$plain"
+        return 0
+    fi
+    if (( REPORT_QUIET )); then
         record "$plain"
         return 0
     fi
@@ -524,6 +535,19 @@ parse_args() {
                 [[ $# -ge 2 ]] || die "--out нуждается в пути"
                 OUT="$2"
                 shift 2 ;;
+            --report|--report=all)
+                if [[ "$1" == "--report=all" ]]; then
+                    REPORT=2
+                    shift
+                elif [[ $# -ge 2 && "$2" == "all" ]]; then
+                    REPORT=2
+                    shift 2
+                else
+                    REPORT=1
+                    shift
+                fi
+                ;;
+            --report=*) die "--report: нужно --report или --report=all" ;;
             --) shift; break ;;
             -*) die "неизвестный ключ: $1" ;;
             *)
@@ -1424,6 +1448,135 @@ kesl_is_status() {
     return 1
 }
 
+kesl_is_active() {
+    local v="${1,,}"
+    case "$v" in
+        "available and running"|running|started) return 0 ;;
+        "задача доступна и выполняется") return 0 ;;
+    esac
+    return 1
+}
+
+kesl_empty_text() {
+    if (( ${KESL_SAW:-0} )); then
+        printf '%s' "активных компонентов нет"
+    else
+        printf '%s' "модули не распознаны"
+    fi
+}
+
+# Папка KUMA или сам каталог /opt. Чужой файл вроде /opt/kaspersky/klnagent не считается.
+kesl_path_covers_kuma() {
+    local p="${1,,}"
+    p=${p//\\//}
+    p=${p#\"}
+    p=${p%\"}
+    p=${p#\'}
+    p=${p%\'}
+    p=${p%/}
+    [[ -n "$p" && "$p" != "/" && "$p" != "*" ]] || return 1
+    local bare=${p%%\*}
+    bare=${bare%/}
+    [[ "$bare" == "/opt" ]] && return 0
+    case "/${p}/" in
+        */kuma/*) return 0 ;;
+    esac
+    return 1
+}
+
+kesl_ex_add() {
+    local p="$1" have
+    p=${p#"${p%%[![:space:]]*}"}
+    p=${p%"${p##*[![:space:]]}"}
+    p=${p#\"}
+    p=${p%\"}
+    p=${p#\'}
+    p=${p%\'}
+    [[ -n "$p" ]] || return 0
+    kesl_path_covers_kuma "$p" || return 0
+    if (( ${#KESL_EX[@]} )); then
+        for have in "${KESL_EX[@]}"; do
+            [[ "${have,,}" == "${p,,}" ]] && return 0
+        done
+    fi
+    KESL_EX+=("$p")
+}
+
+kesl_ex_flush() {
+    local enabled="$1"
+    shift
+    (( enabled )) || return 0
+    local p
+    for p in "$@"; do
+        kesl_ex_add "$p"
+    done
+}
+
+load_kesl_exclusions() {
+    KESL_EX=()
+    KESL_EX_FOUND=0
+    local file="$1" line excl=0 enabled=1 key val klow vlow
+    local -a pending=()
+    [[ -n "$file" && -f "$file" ]] || return 0
+    KESL_EX_FOUND=1
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line=${line%$'\r'}
+        line=${line#"${line%%[![:space:]]*}"}
+        line=${line%"${line##*[![:space:]]}"}
+        [[ -n "$line" && "$line" != \#* && "$line" != \;* ]] || continue
+        if [[ "$line" == \[*\] ]]; then
+            if (( excl )); then
+                kesl_ex_flush "$enabled" "${pending[@]}"
+            fi
+            pending=()
+            excl=0
+            enabled=1
+            line=${line#[}
+            line=${line%]}
+            case "${line,,}" in
+                *exclud*|*исключ*) excl=1 ;;
+            esac
+            continue
+        fi
+        [[ "$line" == *=* ]] || continue
+        key=${line%%=*}
+        val=${line#*=}
+        key=${key#"${key%%[![:space:]]*}"}
+        key=${key%"${key##*[![:space:]]}"}
+        val=${val#"${val%%[![:space:]]*}"}
+        val=${val%"${val##*[![:space:]]}"}
+        klow=${key,,}
+        vlow=${val,,}
+        if (( excl )); then
+            case "$klow" in
+                use*|enabled|active)
+                    case "$vlow" in
+                        no|false|0|off|выкл|нет) enabled=0 ;;
+                    esac
+                    ;;
+                path|mountpoint|programpath|excludemask|excludedpath|folder|mask|путь|*exclud*|*исключ*)
+                    case "$vlow" in
+                        yes|no|true|false|0|1|on|off|да|нет|"*"|"/") ;;
+                        *) pending+=("$val") ;;
+                    esac
+                    ;;
+            esac
+            continue
+        fi
+        case "$klow" in
+            *exclud*|*исключ*)
+                case "$vlow" in
+                    yes|no|true|false|0|1|on|off|да|нет|"*"|"/") ;;
+                    *) kesl_ex_add "$val" ;;
+                esac
+                ;;
+        esac
+    done < "$file"
+    if (( excl )); then
+        kesl_ex_flush "$enabled" "${pending[@]}"
+    fi
+}
+
 kesl_status_color() {
     local v="${1,,}"
     case "$v" in
@@ -1439,6 +1592,7 @@ load_kesl() {
     KESL_NAME=()
     KESL_STATUS=()
     KESL_PRESENT=0
+    KESL_SAW=0
     local file="$1" line key val
     [[ -n "$file" && -f "$file" ]] || return 0
     KESL_PRESENT=1
@@ -1453,6 +1607,8 @@ load_kesl() {
         val=${val%"${val##*[![:space:]]}"}
         [[ -n "$key" && -n "$val" ]] || continue
         kesl_is_status "$val" || continue
+        KESL_SAW=1
+        kesl_is_active "$val" || continue
         KESL_NAME+=("$key")
         KESL_STATUS+=("$val")
     done < "$file"
@@ -1462,12 +1618,11 @@ print_kesl() {
     (( ${KESL_PRESENT:-0} )) || return 0
     local i color plain colored
     section "$C_SVC" "KESL" "$SUFFIX_KESL"
-    emit "  Статусы модулей из appinfo.txt."
+    emit "  Активные компоненты из appinfo.txt."
     emit ""
     if [[ ${#KESL_NAME[@]} -eq 0 ]]; then
-        emit "  Модули не распознаны."
-        return
-    fi
+        emit "  $(kesl_empty_text)."
+    else
     for i in "${!KESL_NAME[@]}"; do
         color=$(kesl_status_color "${KESL_STATUS[$i]}")
         plain=$(printf '  %s  %s' "${KESL_NAME[$i]}" "${KESL_STATUS[$i]}")
@@ -1479,6 +1634,19 @@ print_kesl() {
         fi
         view_put "$plain" "$colored"
     done
+    fi
+    emit ""
+    if (( ${#KESL_EX[@]} )); then
+        emit_c "$C_OK" "  исключения для KUMA добавлены"
+        for i in "${KESL_EX[@]}"; do
+            emit_c "$C_OK" "    $i"
+        done
+    else
+        emit_c "$C_BAD" "  исключения для KUMA не добавлены"
+        if (( ! ${KESL_EX_FOUND:-0} )); then
+            emit "  файл исключений не найден (exset.txt или expset.txt)"
+        fi
+    fi
 }
 
 print_services() {
@@ -2276,6 +2444,19 @@ home_service() {
     box_emit "$plain" "$colored" 0
 }
 
+home_note() {
+    local text="$1" color="$2"
+    local plain="  ${text}" colored
+    if (( $(char_len "$plain") > BOX_IN )); then
+        plain=$(clip_vis "$plain" "$BOX_IN")
+    fi
+    colored=$plain
+    if (( USE_COLOR )); then
+        colored=$(printf '%s%s%s' "$color" "$plain" "$RST")
+    fi
+    box_emit "$plain" "$colored" 0
+}
+
 home_kesl() {
     local name="$1" status="$2"
     local color plain colored room gap nlen slen
@@ -2393,6 +2574,20 @@ draw_home() {
             break
         done
     fi
+    if (( ${KESL_PRESENT:-0} )); then
+        text="  исключения для KUMA добавлены"
+        dlen=$(char_len "$text")
+        if (( dlen > need )); then need=$dlen; fi
+        text="  исключения для KUMA не добавлены"
+        dlen=$(char_len "$text")
+        if (( dlen > need )); then need=$dlen; fi
+        if (( ${#KESL_EX[@]} )); then
+            for text in "${KESL_EX[@]}"; do
+                dlen=$(char_len "    ${text}")
+                if (( dlen > need )); then need=$dlen; fi
+            done
+        fi
+    fi
     BOX_IN=$((TERM_COLS - 3))
     if (( BOX_IN > need )); then
         BOX_IN=$need
@@ -2481,11 +2676,23 @@ draw_home() {
         box_banner "├" "┤" "KESL"
         box_emit "" "" 0
         if [[ ${#KESL_NAME[@]} -eq 0 ]]; then
-            home_kv "KESL" "модули не распознаны" "$C_WARN"
+            home_kv "KESL" "$(kesl_empty_text)" "$C_WARN"
         else
             for i in "${!KESL_NAME[@]}"; do
                 home_kesl "${KESL_NAME[$i]}" "${KESL_STATUS[$i]}"
             done
+        fi
+        box_emit "" "" 0
+        if (( ${#KESL_EX[@]} )); then
+            home_note "исключения для KUMA добавлены" "$C_OK"
+            for text in "${KESL_EX[@]}"; do
+                home_note "  ${text}" "$C_OK"
+            done
+        else
+            home_note "исключения для KUMA не добавлены" "$C_BAD"
+            if (( ! ${KESL_EX_FOUND:-0} )); then
+                home_note "файл исключений не найден" "$C_BAD"
+            fi
         fi
     fi
     box_emit "" "" 0
@@ -3305,7 +3512,77 @@ ui_loop() {
     fi
 }
 
+write_home_report() {
+    local name safe file saved_out saved_skip
+    name=${HOST_NAME:-report}
+    safe=${name//[^[:alnum:]._-]/_}
+    [[ -n "$safe" ]] || safe=report
+    file="${LAUNCH_DIR}/${safe}-report.txt"
+    saved_out=$OUT
+    saved_skip=$SKIP_OUT
+    OUT=$file
+    : > "$OUT" || die "не могу записать $file"
+    SKIP_OUT=0
+    fill_role_menu
+    UI_CAPTURE=1
+    VIEW_PLAIN=()
+    VIEW_DRAW=()
+    draw_home ""
+    UI_CAPTURE=0
+    VIEW_PLAIN=()
+    VIEW_DRAW=()
+    OUT=$saved_out
+    SKIP_OUT=$saved_skip
+    progress "Отчёт первой страницы: $file"
+}
+
+report_path() {
+    local name safe
+    name=${HOST_NAME:-report}
+    safe=${name//[^[:alnum:]._-]/_}
+    [[ -n "$safe" ]] || safe=report
+    printf '%s' "${LAUNCH_DIR}/${safe}-report.txt"
+}
+
+write_full_report() {
+    local file saved_out saved_skip saved_logs saved_awk
+    file=$(report_path)
+    saved_out=$OUT
+    saved_skip=$SKIP_OUT
+    saved_logs=$LOGS_MODE
+    saved_awk=${AWK_TOP:-}
+    OUT=$file
+    : > "$OUT" || die "не могу записать $file"
+    SKIP_OUT=0
+    # В меню логи ещё не выбраны. В полном отчёте разбираются все службы.
+    if [[ "$LOGS_MODE" == "ask" ]]; then
+        LOGS_MODE=all
+    fi
+    AWK_TOP=all
+    if [[ -t 1 ]] && tty_ok; then
+        REPORT_QUIET=1
+    fi
+    emit "Полный отчёт. Сюда входит всё, что скрипт разобрал."
+    print_banner
+    print_host
+    print_disks
+    print_version
+    print_services
+    print_kesl
+    run_logs
+    emit ""
+    emit_c "$DIM" "$(rule 40)"
+    emit_c "$DIM" "Конец отчёта."
+    REPORT_QUIET=0
+    LOGS_MODE=$saved_logs
+    AWK_TOP=$saved_awk
+    OUT=$saved_out
+    SKIP_OUT=$saved_skip
+    progress "Полный отчёт: $file"
+}
+
 main() {
+    LAUNCH_DIR=$(pwd)
     parse_args "$@"
     setup_colors
     if [[ -n "$OUT" ]]; then
@@ -3344,6 +3621,10 @@ main() {
         FILE_TOP=$(find_suffix "$root" "$SUFFIX_TOP")
         FILE_MEMORY=$(find_suffix "$root" "$SUFFIX_MEMORY")
         FILE_KESL=$(find_suffix "$root" "$SUFFIX_KESL")
+        FILE_KESL_EX=$(find_suffix "$root" "$SUFFIX_KESL_EX")
+        if [[ -z "$FILE_KESL_EX" ]]; then
+            FILE_KESL_EX=$(find_suffix "$root" "$SUFFIX_KESL_EXP")
+        fi
         LOGS_TAR=$(find_suffix "$root" "$SUFFIX_LOGS")
     }
 
@@ -3365,7 +3646,9 @@ main() {
             '*/environment/memory.txt' \
             '*/kaspersky/KUMA/services.txt' \
             '*/kaspersky/KUMA/execvers.txt' \
-            '*/kaspersky/KESL/appinfo.txt' 2>&1 >/dev/null) || true
+            '*/kaspersky/KESL/appinfo.txt' \
+            '*/kaspersky/KESL/exset.txt' \
+            '*/kaspersky/KESL/expset.txt' 2>&1 >/dev/null) || true
         if [[ -n "$tar_err" ]]; then
             tar_err=$(printf '%s\n' "$tar_err" | grep -v -e 'Not found in archive' -e 'Exiting with failure status due to previous errors' || true)
             [[ -n "$tar_err" ]] && printf '%s\n' "$tar_err" >&2
@@ -3396,12 +3679,22 @@ main() {
     load_version "${FILE_VERSION:-}"
     load_services "${FILE_SERVICES:-}"
     load_kesl "${FILE_KESL:-}"
+    load_kesl_exclusions "${FILE_KESL_EX:-}"
     load_disks "${FILE_HDD:-}"
     capture_mount_total "${FILE_HDD:-}"
     summarize_disks
 
+    if (( REPORT == 1 )); then
+        write_home_report
+    elif (( REPORT == 2 )); then
+        write_full_report
+    fi
+
     if [[ "$LOGS_MODE" == "ask" && -t 1 ]] && tty_ok; then
         ui_loop
+        return
+    fi
+    if (( REPORT == 2 )); then
         return
     fi
 
