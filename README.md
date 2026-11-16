@@ -2,7 +2,7 @@
 
 `parse-kuma-collect.sh` читает архив коллекта и показывает сводку хоста и ошибки служб KUMA. Рядом `kuma-log-errors.awk`: он разбирает строки лога и группирует одинаковые ошибки. `kuma-log-extract.py` достаёт из `logs.tar` только лог выбранной службы и останавливается, не читая хвост архива. Оболочка достаёт файлы сводки, рисует экраны и красит текст.
 
-Версия в шапке: `parser 0.5.19`, подзаголовок «визуальные улучшения». Поднимайте `PARSER_VERSION` в начале shell-скрипта, когда меняется состав сводки, меню или группировка. Дописывайте строку в конец раздела «История».
+Версия в шапке: `parser 0.5.20`, подзаголовок «визуальные улучшения». Поднимайте `PARSER_VERSION` в начале shell-скрипта, когда меняется состав сводки, меню или группировка. Дописывайте строку в конец раздела «История».
 
 Файлы скрипта — UTF-8, перевод строки LF, без BOM. CRLF в bash даёт `$'\r': command not found`.
 
@@ -64,10 +64,12 @@ wsl bash ./parse-kuma-collect.sh ./srv-kuma-46.adkaleks.loc-2026-11-13_16-20_col
 | `environment/hostname.txt` | имя, ОС, ядро | `load_hostname` |
 | `environment/ipa.txt` | IPv4, вывод `ip address`. Если файла нет, берётся `ifconfig.txt` | `load_ips`, иначе `load_ifconfig` |
 | `environment/cpuinfo.txt` | число ядер и модель. Если файла нет, `hw.ncpu` из `sysctl.txt` | `load_cpu`, иначе `load_cpu_sysctl` |
-| `environment/top.txt` | RAM, load average и `%wa`. Если строки памяти нет, `memory.txt` | `load_mem`, `load_top_pressure` |
+| `environment/top.txt` | RAM, load average, `%wa` и пять процессов сверху: имя, CPU, RAM, резидентная память | `load_mem`, `load_top_pressure`, `load_top_procs` |
+| `environment/uptime.txt` | сколько сервер работает после загрузки. Строка в верхнем блоке | `load_uptime` |
+| `environment/timedatectl.txt` | часовой пояс. Если файла нет, пояс берётся из `date_en.txt` или `date.txt` | `load_timezone` |
 | `kaspersky/KUMA/execvers.txt` | версия бинаря, на образце `4.6.1.54` | `load_version` |
 | `environment/hdd.txt` | точка, устройство (`/dev/sda2`, `/dev/mapper/…`, `//сервер/шара`, бакет S3), тип ФС, свободно, занято и всего | `load_disks` |
-| `kaspersky/KUMA/services.txt` | роль, статус, PID, ID. Файл пишет только Linux-ветка `collect.sh` | `load_services` |
+| `kaspersky/KUMA/services.txt` | роль, статус, PID, ID и сколько служба работает с перезапуска | `load_services` |
 | `kaspersky/KESL/appinfo.txt` | только активные компоненты KESL, английские и русские подписи. Блок есть, только если файл нашёлся | `load_kesl` |
 | `kaspersky/KESL/expset.txt` | исключения папок KUMA. Если в коллекте файл назван `exset.txt`, читается он | `load_kesl_exclusions` |
 | `kaspersky/KUMA/logs.tar` | ошибки одной службы, потоком, без копии файлов | `kuma-log-extract.py`, потом awk |
@@ -175,6 +177,7 @@ URL раньше UUID. `query_id` в адресе ClickHouse сам UUID, и е�
 
 ## История
 
+- **0.5.20** — в верхнем блоке uptime сервера и часовой пояс. В ресурсах пять процессов из `top`. У службы KUMA показано, сколько прошло с перезапуска.
 - **0.5.19** — если установлен KESL, в его блоке проверяются исключения папок из `expset.txt` (`exset.txt`). Папка `kuma` или каталог `/opt` подсвечиваются зелёным, отсутствие таких исключений — красным.
 - **0.5.18** — `--report=all` пишет в тот же `<hostname>-report.txt` всю разобранную сводку и логи всех служб. `--report` по-прежнему только первая страница.
 - **0.5.17** — в блоке KESL остаются только активные компоненты. `--report` пишет первую страницу в `<hostname>-report.txt` в текущую папку.

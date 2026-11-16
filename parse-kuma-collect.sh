@@ -11,7 +11,7 @@ case "${LC_ALL:-${LANG:-C}}" in
     *) export LC_ALL=C.UTF-8 ;;
 esac
 
-PARSER_VERSION="0.5.19"
+PARSER_VERSION="0.5.20"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 AWK_PROG="$SCRIPT_DIR/kuma-log-errors.awk"
 EXTRACT_PROG="$SCRIPT_DIR/kuma-log-extract.py"
@@ -25,6 +25,10 @@ SUFFIX_IFCONFIG="environment/ifconfig.txt"
 SUFFIX_CPU="environment/cpuinfo.txt"
 SUFFIX_SYSCTL="environment/sysctl.txt"
 SUFFIX_TOP="environment/top.txt"
+SUFFIX_UPTIME="environment/uptime.txt"
+SUFFIX_TIMEDATE="environment/timedatectl.txt"
+SUFFIX_DATE="environment/date.txt"
+SUFFIX_DATE_EN="environment/date_en.txt"
 SUFFIX_MEMORY="environment/memory.txt"
 SUFFIX_LOGS="kaspersky/KUMA/logs.tar"
 SUFFIX_KESL="kaspersky/KESL/appinfo.txt"
@@ -928,6 +932,137 @@ fill_pressure() {
     fi
 }
 
+squeeze_spaces() {
+    local s="$1"
+    while [[ "$s" == *"  "* ]]; do
+        s=${s//  / }
+    done
+    printf '%s' "$s"
+}
+
+load_uptime() {
+    HOST_UPTIME=""
+    local file="$1" line rest
+    [[ -f "$file" ]] || return 0
+    IFS= read -r line < "$file" || return 0
+    line=${line%$'\r'}
+    [[ "$line" =~ up[[:space:]]+(.*) ]] || return 0
+    rest=${BASH_REMATCH[1]}
+    if [[ "$rest" =~ ^(.+),[[:space:]]+[0-9]+[[:space:]]+(users?|пользовател) ]]; then
+        rest=${BASH_REMATCH[1]}
+    elif [[ "$rest" =~ ^(.+),[[:space:]]*(load[[:space:]]+average|средн) ]]; then
+        rest=${BASH_REMATCH[1]}
+    fi
+    rest=${rest#"${rest%%[![:space:]]*}"}
+    rest=${rest%"${rest##*[![:space:]]}"}
+    rest=${rest%,}
+    HOST_UPTIME=$(squeeze_spaces "$rest")
+}
+
+load_timezone() {
+    HOST_TZ=""
+    local timedate="$1" date_en="$2" date_file="$3" line val
+    if [[ -f "$timedate" ]]; then
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            line=${line%$'\r'}
+            if [[ "$line" =~ (Time[[:space:]]*zone|Timezone|Часовой[[:space:]]+пояс)[[:space:]]*:[[:space:]]*(.+)$ ]]; then
+                val=${BASH_REMATCH[2]}
+                val=${val%"${val##*[![:space:]]}"}
+                HOST_TZ=$val
+                return 0
+            fi
+        done < "$timedate"
+    fi
+    for line in "$date_en" "$date_file"; do
+        [[ -f "$line" ]] || continue
+        IFS= read -r val < "$line" || continue
+        val=${val%$'\r'}
+        if [[ "$val" =~ [[:space:]]([A-Za-z]{2,5})[[:space:]]+[0-9]{4}[[:space:]]*$ ]]; then
+            HOST_TZ=${BASH_REMATCH[1]}
+            return 0
+        fi
+    done
+}
+
+res_phrase() {
+    local n="$1"
+    if [[ "$n" =~ ^[0-9]+$ ]]; then
+        if (( n >= 1048576 )); then
+            awk -v n="$n" 'BEGIN { printf "%.1f GB", n / 1048576 }'
+        elif (( n >= 1024 )); then
+            awk -v n="$n" 'BEGIN { printf "%.0f MB", n / 1024 }'
+        else
+            printf '%s KB' "$n"
+        fi
+    else
+        printf '%s' "$n"
+    fi
+}
+
+load_top_procs() {
+    TOP_PROC_CMD=()
+    TOP_PROC_CPU=()
+    TOP_PROC_MEM=()
+    TOP_PROC_RES=()
+    local file="$1" line cmd cpu mem res
+    [[ -f "$file" ]] || return 0
+    while IFS=$'\036' read -r cmd cpu mem res || [[ -n "${cmd:-}" ]]; do
+        [[ -n "${cmd:-}" ]] || continue
+        [[ "$cpu" == *% ]] || cpu="${cpu}%"
+        [[ "$mem" == *% ]] || mem="${mem}%"
+        TOP_PROC_CMD+=("$cmd")
+        TOP_PROC_CPU+=("$cpu")
+        TOP_PROC_MEM+=("$mem")
+        TOP_PROC_RES+=("$(res_phrase "$res")")
+    done < <(awk '
+        BEGIN { cpu = 0; mem = 0; res = 0; cmd = 0; n = 0 }
+        cpu == 0 {
+            for (i = 1; i <= NF; i++) {
+                if ($i == "%CPU") cpu = i
+                else if ($i == "%MEM") mem = i
+                else if ($i == "RES") res = i
+                else if ($i == "COMMAND" || $i == "Command") cmd = i
+            }
+            next
+        }
+        $1 ~ /^[0-9]+$/ && cmd > 0 && NF >= cmd && n < 5 {
+            name = $cmd
+            for (i = cmd + 1; i <= NF; i++) name = name " " $i
+            printf "%s\036%s\036%s\036%s\n", name, $cpu, $mem, $res
+            n++
+        }
+    ' "$file")
+}
+
+svc_age() {
+    local s="$1"
+    [[ -n "$s" ]] || return 0
+    if [[ "$s" == *";"* ]]; then
+        s=${s##*;}
+    fi
+    s=${s#"${s%%[![:space:]]*}"}
+    s=${s%"${s##*[![:space:]]}"}
+    s=${s% ago}
+    s=${s% назад}
+    s=${s//min/ min}
+    s=${s//sec/ sec}
+    s=${s//мин/ мин}
+    s=${s//сек/ сек}
+    s=$(printf '%s' "$s" | sed -E 's/([0-9])s([^[:alpha:]]|$)/\1 s\2/g')
+    squeeze_spaces "$s"
+}
+
+svc_age_label() {
+    local since="$1" state="$2" age
+    age=$(svc_age "$since")
+    [[ -n "$age" ]] || return 0
+    if [[ "$state" == *running* ]]; then
+        printf 'up %s' "$age"
+    else
+        printf 'off %s' "$age"
+    fi
+}
+
 emit_mem_cpu() {
     local cpu
     if [[ -z "${HOST_MEM_TEXT:-}" ]]; then
@@ -949,6 +1084,14 @@ emit_mem_cpu() {
     fi
     if [[ -n "$PRESS_WA_VALUE" ]]; then
         field "$C_HOST" "WA" "$PRESS_WA_VALUE" "$PRESS_WA_COLOR"
+    fi
+    if [[ ${#TOP_PROC_CMD[@]} -eq 0 ]]; then
+        field "$C_HOST" "top" "не распознан"
+    else
+        local i
+        for i in "${!TOP_PROC_CMD[@]}"; do
+            field "$C_HOST" "$((i + 1))" "${TOP_PROC_CMD[$i]}  CPU ${TOP_PROC_CPU[$i]}  RAM ${TOP_PROC_MEM[$i]}  ${TOP_PROC_RES[$i]}"
+        done
     fi
 }
 
@@ -1326,6 +1469,8 @@ print_host() {
             field "$C_HOST" "IPv4" "$ip"
         done
     fi
+    field "$C_HOST" "uptime" "${HOST_UPTIME:-не найден}"
+    field "$C_HOST" "пояс" "${HOST_TZ:-не найден}"
     field "$C_HOST" "ОС" "$HOST_OS"
     field "$C_HOST" "ядро" "$HOST_KERNEL"
     emit ""
@@ -1661,7 +1806,7 @@ print_services() {
         emit "  Службы не распознаны. Формат services.txt изменился или файл пуст."
         return
     fi
-    local idx role title state sc pid boot running=0
+    local idx role title state sc pid boot age running=0
     while IFS= read -r idx; do
         role=${svc_role[$idx]}
         [[ -n "$role" ]] || role=${svc_unit[$idx]}
@@ -1672,6 +1817,10 @@ print_services() {
         state=${svc_state[$idx]}
         sc=$(status_color "$state")
         field "$C_SVC" "статус" "${state:-—}" "$sc$BOLD"
+        age=$(svc_age "${svc_since[$idx]}")
+        if [[ -n "$age" ]]; then
+            field "$C_SVC" "uptime" "$age"
+        fi
         [[ -n "${svc_since[$idx]}" ]] && field "$C_SVC" "с" "${svc_since[$idx]}"
         pid=${svc_pid[$idx]}
         field "$C_SVC" "PID" "${pid:-нет}"
@@ -2413,6 +2562,74 @@ home_split() {
     box_emit "$plain" "$colored" 0
 }
 
+service_row_text() {
+    local role="$1" state="$2" pid="$3" sid="${4:-}"
+    local word role_f state_f pid_f plain
+    word=$(svc_word "$state")
+    role_f=$(pad "$role" 12)
+    state_f=$(pad "$word" 9)
+    [[ -n "$pid" ]] || pid="—"
+    [[ -n "$sid" ]] || sid="—"
+    pid_f=$(pad "$pid" 8)
+    plain=$(printf '  ● %s%sPID %s%s' "$role_f" "$state_f" "$pid_f" "$sid")
+    printf '%s' "$plain"
+}
+
+top_measure() {
+    TOP_W_CMD=1
+    TOP_W_CPU=1
+    TOP_W_MEM=1
+    TOP_W_RES=1
+    local i n
+    [[ ${#TOP_PROC_CMD[@]} -gt 0 ]] || return 0
+    for i in "${!TOP_PROC_CMD[@]}"; do
+        n=$(char_len "${TOP_PROC_CMD[$i]}")
+        if (( n > TOP_W_CMD )); then TOP_W_CMD=$n; fi
+        n=$(char_len "${TOP_PROC_CPU[$i]}")
+        if (( n > TOP_W_CPU )); then TOP_W_CPU=$n; fi
+        n=$(char_len "${TOP_PROC_MEM[$i]}")
+        if (( n > TOP_W_MEM )); then TOP_W_MEM=$n; fi
+        n=$(char_len "${TOP_PROC_RES[$i]}")
+        if (( n > TOP_W_RES )); then TOP_W_RES=$n; fi
+    done
+}
+
+top_row_text() {
+    local cmd_f cpu_f mem_f res_f
+    cmd_f=$(pad "$1" "${TOP_W_CMD:-1}")
+    cpu_f=$(pad "$2" "${TOP_W_CPU:-1}")
+    mem_f=$(pad "$3" "${TOP_W_MEM:-1}")
+    res_f=$(pad "$4" "${TOP_W_RES:-1}")
+    printf '  %s  CPU %s  RAM %s  %s' "$cmd_f" "$cpu_f" "$mem_f" "$res_f"
+}
+
+home_proc() {
+    local plain colored wide cmd_f cpu_f mem_f res_f
+    plain=$(top_row_text "$1" "$2" "$3" "$4")
+    wide=0
+    if (( $(char_len "$plain") > BOX_IN )); then
+        plain=$(clip_vis "$plain" "$BOX_IN")
+        wide=1
+    fi
+    colored=$plain
+    if (( USE_COLOR )); then
+        if (( wide )); then
+            colored="${C_TEXT}${plain}${RST}"
+        else
+            cmd_f=$(pad "$1" "${TOP_W_CMD:-1}")
+            cpu_f=$(pad "$2" "${TOP_W_CPU:-1}")
+            mem_f=$(pad "$3" "${TOP_W_MEM:-1}")
+            res_f=$(pad "$4" "${TOP_W_RES:-1}")
+            colored=$(printf '  %s%s%s  %sCPU %s%s  %sRAM %s%s  %s%s%s' \
+                "$C_TEXT" "$cmd_f" "$RST" \
+                "$DIM" "$cpu_f" "$RST" \
+                "$DIM" "$mem_f" "$RST" \
+                "$C_HOST" "$res_f" "$RST")
+        fi
+    fi
+    box_emit "$plain" "$colored" 0
+}
+
 home_service() {
     local role="$1" state="$2" pid="$3" sid="${4:-}"
     local word scol role_f state_f pid_f plain colored
@@ -2423,7 +2640,7 @@ home_service() {
     [[ -n "$pid" ]] || pid="—"
     [[ -n "$sid" ]] || sid="—"
     pid_f=$(pad "$pid" 8)
-    plain=$(printf '  ● %s%sPID %s%s' "$role_f" "$state_f" "$pid_f" "$sid")
+    plain=$(service_row_text "$role" "$state" "$pid" "$sid")
     if (( $(char_len "$plain") > BOX_IN )); then
         plain=$(clip_vis "$plain" "$BOX_IN")
         colored=$plain
@@ -2558,7 +2775,7 @@ home_prompt() {
 }
 
 draw_home() {
-    local typed="${1:-}" i=1 role extra ip name state pid mnt dev fs used avail size
+    local typed="${1:-}" i=1 role extra ip name state pid age mnt dev fs used avail size
     local mark cpu model pct="" free="" pair label count noun
     local need=78 dlen text
     term_size
@@ -2573,6 +2790,21 @@ draw_home() {
             fi
             break
         done
+    fi
+    top_measure
+    if (( ${#TOP_PROC_CMD[@]} )); then
+        for i in "${!TOP_PROC_CMD[@]}"; do
+            text=$(top_row_text "${TOP_PROC_CMD[$i]}" "${TOP_PROC_CPU[$i]}" "${TOP_PROC_MEM[$i]}" "${TOP_PROC_RES[$i]}")
+            dlen=$(char_len "$text")
+            if (( dlen > need )); then need=$dlen; fi
+        done
+    fi
+    if (( ${#svc_unit[@]} )); then
+        while IFS= read -r i; do
+            text=$(service_row_text "${svc_role[$i]:-прочее}" "${svc_state[$i]:-?}" "${svc_pid[$i]:-—}" "${svc_id[$i]:-без id}")
+            dlen=$(char_len "$text")
+            if (( dlen > need )); then need=$dlen; fi
+        done < <(sorted_service_indexes)
     fi
     if (( ${KESL_PRESENT:-0} )); then
         text="  исключения для KUMA добавлены"
@@ -2611,6 +2843,16 @@ draw_home() {
             home_kv "ADDRESS" "$ip"
         done
     fi
+    if [[ -n "${HOST_UPTIME:-}" ]]; then
+        home_kv "UPTIME" "$HOST_UPTIME"
+    else
+        home_kv "UPTIME" "не найден" "$C_WARN"
+    fi
+    if [[ -n "${HOST_TZ:-}" ]]; then
+        home_kv "TZ" "$HOST_TZ"
+    else
+        home_kv "TZ" "не найден" "$C_WARN"
+    fi
     home_kv "SYSTEM" "${HOST_OS:-—}"
     home_kv "KERNEL" "${HOST_KERNEL:-—}"
     if [[ ${#VER_LINES[@]} -gt 0 ]]; then
@@ -2648,6 +2890,14 @@ draw_home() {
     else
         home_kv "MEMORY" "не найдена" "$C_WARN"
     fi
+    home_split "TOP"
+    if [[ ${#TOP_PROC_CMD[@]} -eq 0 ]]; then
+        home_kv "TOP" "не распознан" "$C_WARN"
+    else
+        for i in "${!TOP_PROC_CMD[@]}"; do
+            home_proc "${TOP_PROC_CMD[$i]}" "${TOP_PROC_CPU[$i]}" "${TOP_PROC_MEM[$i]}" "${TOP_PROC_RES[$i]}"
+        done
+    fi
     home_split "DISK"
     if [[ ${#disk_mnt[@]} -eq 0 ]]; then
         home_kv "DISK" "не распознаны" "$C_WARN"
@@ -2669,6 +2919,8 @@ draw_home() {
             state=${svc_state[$i]:-?}
             pid=${svc_pid[$i]:-—}
             home_service "$role" "$state" "$pid" "${svc_id[$i]:-без id}"
+            age=$(svc_age_label "${svc_since[$i]:-}" "$state")
+            [[ -n "$age" ]] && home_note "  $age" "$DIM"
         done < <(sorted_service_indexes)
     fi
     if (( ${KESL_PRESENT:-0} )); then
@@ -3619,6 +3871,10 @@ main() {
         FILE_CPU=$(find_suffix "$root" "$SUFFIX_CPU")
         FILE_SYSCTL=$(find_suffix "$root" "$SUFFIX_SYSCTL")
         FILE_TOP=$(find_suffix "$root" "$SUFFIX_TOP")
+        FILE_UPTIME=$(find_suffix "$root" "$SUFFIX_UPTIME")
+        FILE_TIMEDATE=$(find_suffix "$root" "$SUFFIX_TIMEDATE")
+        FILE_DATE=$(find_suffix "$root" "$SUFFIX_DATE")
+        FILE_DATE_EN=$(find_suffix "$root" "$SUFFIX_DATE_EN")
         FILE_MEMORY=$(find_suffix "$root" "$SUFFIX_MEMORY")
         FILE_KESL=$(find_suffix "$root" "$SUFFIX_KESL")
         FILE_KESL_EX=$(find_suffix "$root" "$SUFFIX_KESL_EX")
@@ -3643,6 +3899,10 @@ main() {
             '*/environment/cpuinfo.txt' \
             '*/environment/sysctl.txt' \
             '*/environment/top.txt' \
+            '*/environment/uptime.txt' \
+            '*/environment/timedatectl.txt' \
+            '*/environment/date.txt' \
+            '*/environment/date_en.txt' \
             '*/environment/memory.txt' \
             '*/kaspersky/KUMA/services.txt' \
             '*/kaspersky/KUMA/execvers.txt' \
@@ -3676,6 +3936,9 @@ main() {
     fi
     load_mem "${FILE_TOP:-}" "${FILE_MEMORY:-}"
     load_top_pressure "${FILE_TOP:-}"
+    load_top_procs "${FILE_TOP:-}"
+    load_uptime "${FILE_UPTIME:-}"
+    load_timezone "${FILE_TIMEDATE:-}" "${FILE_DATE_EN:-}" "${FILE_DATE:-}"
     load_version "${FILE_VERSION:-}"
     load_services "${FILE_SERVICES:-}"
     load_kesl "${FILE_KESL:-}"
