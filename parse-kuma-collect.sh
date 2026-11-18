@@ -11,7 +11,7 @@ case "${LC_ALL:-${LANG:-C}}" in
     *) export LC_ALL=C.UTF-8 ;;
 esac
 
-PARSER_VERSION="0.5.20"
+PARSER_VERSION="0.6"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 AWK_PROG="$SCRIPT_DIR/kuma-log-errors.awk"
 EXTRACT_PROG="$SCRIPT_DIR/kuma-log-extract.py"
@@ -70,6 +70,11 @@ MENU_NOTE=""
 UI_CAPTURE=0
 UI_KEY_MODE="log"
 MOUSE_ON=0
+FIND_QUERY=""
+FIND_NOTE=""
+FIND_POS=0
+FIND_EDIT=0
+FIND_HITS=()
 CURSOR_HIDDEN=0
 AWK_TOP=""
 LOG_VIEW="all"
@@ -104,6 +109,7 @@ usage() {
 Меню в терминале: номер или имя компонента (core, collector, storage…).
 Однозначный номер и имя открываются сразу, Enter подтверждает незаконченное.
 Сводку и логи листают колёсико, стрелки и PgUp/PgDn.
+Текст выделяется мышкой, как в обычном терминале. Поиск по всему списку: /.
 Перед логом спрашивается, что показать: 1 ошибки, 2 debug, 3 всё.
 b — к выбору компонента, i — к списку ID, c — конфигурация collector, q — выход.
 EOF
@@ -460,7 +466,7 @@ normalize_path() {
 
 mouse_off() {
     if [[ "$MOUSE_ON" -eq 1 ]]; then
-        printf '\033[?1000l\033[?1006l' >/dev/tty 2>/dev/null || true
+        printf '\033[?1007l\033[?1000l\033[?1006l' >/dev/tty 2>/dev/null || true
         MOUSE_ON=0
     fi
 }
@@ -3095,7 +3101,7 @@ view_prepare() {
 }
 
 paint_rows() {
-    local foot="$1" color="${2:-$DIM}" i line
+    local foot="$1" color="${2:-$DIM}" i line hit h row plain
     if (( USE_COLOR )) && [[ -n "$BG_BASE" ]]; then
         printf '%s\033[H' "$BG_BASE" >/dev/tty
     else
@@ -3103,8 +3109,27 @@ paint_rows() {
     fi
     for ((i = 0; i < VIEW_BODY; i++)); do
         line=""
-        if (( SCROLL + i < VIEW_TOTAL )); then
-            line=${SCREEN_ROWS[$((SCROLL + i))]}
+        row=$((SCROLL + i))
+        if (( row < VIEW_TOTAL )); then
+            line=${SCREEN_ROWS[$row]}
+        fi
+        hit=0
+        if (( ${#FIND_HITS[@]} )) && (( row < VIEW_TOTAL )); then
+            for h in "${!FIND_HITS[@]}"; do
+                if (( FIND_HITS[h] == row && h == FIND_POS )); then
+                    hit=1
+                    break
+                fi
+            done
+        fi
+        if (( hit )); then
+            plain=$(strip_ansi "$line")
+            if (( USE_COLOR )); then
+                printf '\033[2K\033[38;2;11;15;20m\033[48;2;240;180;77m%s%s\n' "$plain" "$RST" >/dev/tty
+            else
+                printf '\033[2K%s\n' "$plain" >/dev/tty
+            fi
+            continue
         fi
         if (( USE_COLOR )) && [[ -n "$BG_BASE" ]]; then
             printf '%s\033[2K%s\n' "$BG_BASE" "$line" >/dev/tty
@@ -3112,10 +3137,92 @@ paint_rows() {
             printf '\033[2K%s\n' "$line" >/dev/tty
         fi
     done
+    if [[ "${FIND_EDIT:-0}" -eq 0 ]]; then
+        if [[ -n "${FIND_NOTE:-}" ]]; then
+            foot="${FIND_NOTE} · ${foot}"
+        else
+            foot="/ поиск · ${foot}"
+        fi
+    fi
     if (( ${#foot} > TERM_COLS - 1 )); then
         foot=${foot:0:TERM_COLS-1}
     fi
     printf '\033[2K%s%s%s' "$color" "$foot" "$RST" >/dev/tty
+}
+
+strip_ansi() {
+    printf '%s' "$1" | sed -E $'s/\x1B\\[[0-9;]*[[:alpha:]]//g'
+}
+
+ui_find_step() {
+    local dir="$1" n idx
+    n=${#FIND_HITS[@]}
+    (( n > 0 )) || return 0
+    FIND_POS=$(( (FIND_POS + dir + n) % n ))
+    idx=${FIND_HITS[$FIND_POS]}
+    SCROLL=$idx
+    FIND_NOTE="$((FIND_POS + 1))/${n}  «${FIND_QUERY}»  n дальше  N назад"
+}
+
+ui_find_run() {
+    local q="$1" i plain low
+    FIND_QUERY=$q
+    FIND_HITS=()
+    FIND_POS=0
+    low=${q,,}
+    view_prepare
+    for i in "${!SCREEN_ROWS[@]}"; do
+        plain=$(strip_ansi "${SCREEN_ROWS[$i]}")
+        [[ "${plain,,}" == *"$low"* ]] && FIND_HITS+=("$i")
+    done
+    if (( ${#FIND_HITS[@]} == 0 )); then
+        FIND_NOTE="нет «${FIND_QUERY}»"
+        return 0
+    fi
+    ui_find_step 0
+}
+
+ui_find_prompt() {
+    local saved=$UI_KEY_MODE q="" ev ch
+    UI_KEY_MODE=find
+    FIND_EDIT=1
+    cursor_show
+    while true; do
+        view_prepare
+        paint_rows "  / ${q}   Enter · Esc отмена" "$C_ASK"
+        ev=$(read_ui_event)
+        case "$ev" in
+            submit)
+                [[ -n "$q" ]] && ui_find_run "$q"
+                break
+                ;;
+            esc) break ;;
+            bs) q=${q%?} ;;
+            key:*)
+                ch=${ev#key:}
+                q+="$ch"
+                ;;
+        esac
+    done
+    FIND_EDIT=0
+    UI_KEY_MODE=$saved
+    printf '\033[?25l' >/dev/tty
+    CURSOR_HIDDEN=1
+}
+
+ui_find_clear() {
+    FIND_QUERY=""
+    FIND_NOTE=""
+    FIND_POS=0
+    FIND_HITS=()
+}
+
+ui_find_event() {
+    case "$1" in
+        find) ui_find_prompt ;;
+        findnext) ui_find_step 1 ;;
+        findprev) ui_find_step -1 ;;
+    esac
 }
 
 paint_log_view() {
@@ -3174,6 +3281,19 @@ read_ui_event() {
     # -N, не -n: Enter это перевод строки, а -n считает его концом ввода и возвращает пусто.
     IFS= read -rsN1 k </dev/tty || { printf 'quit'; return 0; }
     if [[ "$k" != $'\033' ]]; then
+        if [[ "$UI_KEY_MODE" != "find" && ( "$k" == $'\x06' || "$k" == '/' ) ]]; then
+            printf 'find'
+            return 0
+        fi
+        if [[ "$UI_KEY_MODE" == "find" ]]; then
+            case "$k" in
+                $'\n'|$'\r') printf 'submit' ;;
+                $'\x7f'|$'\b') printf 'bs' ;;
+                [[:print:]]) printf 'key:%s' "$k" ;;
+                *) printf 'none' ;;
+            esac
+            return 0
+        fi
         if [[ "$UI_KEY_MODE" == "menu" ]]; then
             case "$k" in
                 $'\n'|$'\r') printf 'submit' ;;
@@ -3192,11 +3312,17 @@ read_ui_event() {
             ' ') printf 'pagedown' ;;
             j|J) printf 'down' ;;
             k|K) printf 'up' ;;
+            n)
+                if [[ -n "$FIND_QUERY" ]]; then printf 'findnext'; else printf 'none'; fi
+                ;;
+            N)
+                if [[ -n "$FIND_QUERY" ]]; then printf 'findprev'; else printf 'none'; fi
+                ;;
             *) printf 'none' ;;
         esac
         return 0
     fi
-    IFS= read -rsN1 -t 0.1 c </dev/tty || { printf 'none'; return 0; }
+    IFS= read -rsN1 -t 0.1 c </dev/tty || { printf 'esc'; return 0; }
     if [[ "$c" != '[' && "$c" != 'O' ]]; then
         printf 'none'
         return 0
@@ -3238,7 +3364,8 @@ read_ui_event() {
 }
 
 arm_scroll() {
-    printf '\033[?1000h\033[?1006h' >/dev/tty
+    # Только колесо как стрелки. Кнопки мыши остаются терминалу: выделение и копирование обычные.
+    printf '\033[?1000l\033[?1006l\033[?1007h' >/dev/tty
     MOUSE_ON=1
     printf '\033[?25l' >/dev/tty
     CURSOR_HIDDEN=1
@@ -3246,6 +3373,7 @@ arm_scroll() {
 
 scroll_log_view() {
     local ev step
+    ui_find_clear
     SCROLL=0
     ROW_COLS=-1
     UI_AFTER=home
@@ -3264,6 +3392,7 @@ scroll_log_view() {
             pagedown) SCROLL=$((SCROLL + step)) ;;
             home) SCROLL=0 ;;
             end) SCROLL=999999 ;;
+            find|findnext|findprev) ui_find_event "$ev" ;;
             back) UI_AFTER=home; break ;;
             id) UI_AFTER=id; break ;;
             config)
@@ -3319,6 +3448,7 @@ home_ready() {
 scroll_home() {
     local ev ch step typed="" drawn="*"
     HOME_CHOICE=""
+    ui_find_clear
     SCROLL=0
     ROW_COLS=-1
     UI_KEY_MODE="menu"
@@ -3345,6 +3475,7 @@ scroll_home() {
             pagedown) SCROLL=$((SCROLL + step)) ;;
             home) SCROLL=0 ;;
             end) SCROLL=999999 ;;
+            find|findnext|findprev) ui_find_event "$ev" ;;
             bs) typed=${typed%?} ;;
             submit)
                 HOME_CHOICE=$typed
@@ -3352,6 +3483,14 @@ scroll_home() {
                 ;;
             key:*)
                 ch=${ev#key:}
+                if [[ -z "$typed" && -n "$FIND_QUERY" && "$ch" == "n" ]]; then
+                    ui_find_step 1
+                    continue
+                fi
+                if [[ -z "$typed" && -n "$FIND_QUERY" && "$ch" == "N" ]]; then
+                    ui_find_step -1
+                    continue
+                fi
                 if [[ -z "$typed" && ( "$ch" == "q" || "$ch" == "Q" ) ]]; then
                     HOME_CHOICE=q
                     break
@@ -3371,6 +3510,7 @@ scroll_home() {
 scroll_id() {
     local ev ch step typed="" drawn="*" role="$1"
     ID_CHOICE=""
+    ui_find_clear
     SCROLL=0
     ROW_COLS=-1
     UI_KEY_MODE="menu"
@@ -3397,6 +3537,7 @@ scroll_id() {
             pagedown) SCROLL=$((SCROLL + step)) ;;
             home) SCROLL=0 ;;
             end) SCROLL=999999 ;;
+            find|findnext|findprev) ui_find_event "$ev" ;;
             bs) typed=${typed%?} ;;
             submit)
                 ID_CHOICE=$typed
@@ -3404,6 +3545,14 @@ scroll_id() {
                 ;;
             key:*)
                 ch=${ev#key:}
+                if [[ -z "$typed" && -n "$FIND_QUERY" && "$ch" == "n" ]]; then
+                    ui_find_step 1
+                    continue
+                fi
+                if [[ -z "$typed" && -n "$FIND_QUERY" && "$ch" == "N" ]]; then
+                    ui_find_step -1
+                    continue
+                fi
                 if [[ -z "$typed" && ( "$ch" == "q" || "$ch" == "Q" ) ]]; then
                     ID_CHOICE=q
                     break
@@ -3438,6 +3587,7 @@ load_configs() {
 
 scroll_plain() {
     local foot="$1" ev step
+    ui_find_clear
     SCROLL=0
     ROW_COLS=-1
     UI_KEY_MODE="log"
@@ -3455,6 +3605,7 @@ scroll_plain() {
             pagedown) SCROLL=$((SCROLL + step)) ;;
             home) SCROLL=0 ;;
             end) SCROLL=999999 ;;
+            find|findnext|findprev) ui_find_event "$ev" ;;
             back) UI_AFTER=back; break ;;
             config) UI_AFTER=back; break ;;
             quit) UI_AFTER=quit; break ;;
@@ -3535,6 +3686,7 @@ show_config_browser() {
                 pagedown) SCROLL=$((SCROLL + step)) ;;
                 home) SCROLL=0 ;;
                 end) SCROLL=999999 ;;
+                find|findnext|findprev) ui_find_event "$ev" ;;
                 bs) typed=${typed%?} ;;
                 submit)
                     if number_ready "$typed" "${#CFG_NAMES[@]}"; then
@@ -3548,6 +3700,14 @@ show_config_browser() {
                     ;;
                 key:*)
                     ch=${ev#key:}
+                    if [[ -z "$typed" && -n "$FIND_QUERY" && "$ch" == "n" ]]; then
+                        ui_find_step 1
+                        continue
+                    fi
+                    if [[ -z "$typed" && -n "$FIND_QUERY" && "$ch" == "N" ]]; then
+                        ui_find_step -1
+                        continue
+                    fi
                     if [[ -z "$typed" && ( "$ch" == "q" || "$ch" == "Q" ) ]]; then
                         UI_AFTER=quit
                         mouse_off
